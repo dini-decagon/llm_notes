@@ -93,6 +93,29 @@ loop running on *one* thread, and they are **not thread-safe**. You must not cal
 
 ## 4. Walking through one streaming request
 
+> **Which context runs which step?** Keep this mapping in mind as you read:
+>
+> - **Step 1** (the `/generate_stream` handler + inner `event_generator` wrapper in
+>   `main.py`) → **Context A** (the event loop). uvicorn invokes the `async def` handler
+>   on the loop.
+> - **Step 2** (`LLMEngine.event_generator` — creating the `asyncio.Queue` and
+>   `await queue.get()`) → also **Context A**. It's an async generator driven by that same
+>   loop; the `await` parks it *on the loop's thread*. Because the queue is created here, it
+>   **belongs to Context A** — which is exactly why Step 3 can't touch it directly.
+> - **Step 3** (`requests_processing_loop`) → **Context B**, the background
+>   `threading.Thread`. Inside it, `execute_forward_batch(...)` also hands the batch off to
+>   the model **process** (**Context C**) and blocks on the result until a token returns.
+>
+> ```
+> A (parked on await queue.get())
+>         ▲
+>         │ run_coroutine_threadsafe(queue.put(token), loop)
+>         │
+> B (requests_processing_loop) ──batch──► C (model process) ──token──► B
+> ```
+>
+> So: Steps 1–2 run on A, Step 3 runs on B, and B delegates the actual compute to C.
+
 ### Step 1 — The endpoint (`main.py`)
 
 ```python
