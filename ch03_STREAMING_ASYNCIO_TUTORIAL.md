@@ -342,3 +342,151 @@ mailbox" is exactly why each `Sequence` stores its own `loop` and `client_stream
 > **`asyncio.run_coroutine_threadsafe(queue.put(token), loop)`** to ask A's event loop to
 > do the `put` on A's own thread. That single call is the safe bridge between the two
 > threads, and it's the crux of the whole design.
+
+---
+
+## Appendix: asyncio crash course
+
+A short reference for every asyncio concept this tutorial leans on. Read top-to-bottom the
+first time; after that, use it as a lookup table.
+
+### A.1 The event loop
+
+An **event loop** is a scheduler that runs on **one thread**. It keeps a to-do list of
+tasks and runs them one at a time. A task runs until it *voluntarily yields* (see `await`),
+at which point the loop picks the next ready task. Nothing on the loop runs in true
+parallel — tasks take turns very quickly. In this project, `uvicorn` creates and drives the
+event loop; all your request handlers run on it.
+
+```python
+loop = asyncio.get_event_loop()   # a handle to the running loop (Context A in the tutorial)
+```
+
+### A.2 Coroutines and `async def`
+
+A function defined with `async def` is a **coroutine function**. Calling it does *not* run
+it — it returns a coroutine object that only makes progress when driven by the loop (via
+`await` or being scheduled as a task).
+
+```python
+async def event_generator(self, loop, prompt): ...   # coroutine function
+```
+
+Rule of thumb: `async def` marks code that is *allowed to pause*.
+
+### A.3 `await` — the yield point
+
+`await something` means: "pause here, hand control back to the event loop, and resume me
+once `something` is ready." While paused, the coroutine uses **zero CPU** and the loop is
+free to run other tasks. This is why one server thread can juggle thousands of idle
+connections.
+
+```python
+data = await queue.get()   # parks until a token is available; loop serves others meanwhile
+```
+
+You can only use `await` inside an `async def`. The thing you await must be *awaitable*
+(a coroutine, Task, or Future).
+
+### A.4 Cooperative vs. preemptive concurrency
+
+- **Threads** (Context B) are *preemptive*: the OS can switch between them at any instant,
+  so shared data needs locks / thread-safe structures.
+- **asyncio tasks** are *cooperative*: a switch happens **only** at an `await`. Between two
+  `await`s, your code runs uninterrupted. That makes reasoning easier — but it also means a
+  single long, non-awaiting computation (like a model forward pass) would **freeze the whole
+  loop**. That freeze is exactly why the heavy work was pushed onto a separate thread.
+
+### A.5 `asyncio.Queue` — an async mailbox
+
+`asyncio.Queue` is a queue whose `.get()` and `.put()` are **coroutines** you `await`. If
+the queue is empty, `await queue.get()` parks the consumer instead of blocking the thread.
+
+```python
+queue = asyncio.Queue()
+await queue.put(item)   # producer side
+item = await queue.get()  # consumer side, parks if empty
+```
+
+**Critical caveat (the whole reason this tutorial exists):** an `asyncio.Queue` is tied to
+the loop/thread that created it and is **not thread-safe**. Never call its methods from
+another thread. Compare with `queue.Queue` (from the standard `queue` module), which *is*
+thread-safe and is used for the plain A→B hand-off in `WorkloadManager`.
+
+| Queue type | Safe to use from | `.get()` behavior |
+|---|---|---|
+| `asyncio.Queue` | one event loop / thread only | `await` — parks the coroutine |
+| `queue.Queue` | any thread (thread-safe) | blocks the calling thread |
+| `multiprocessing.Queue` | any process (process-safe) | blocks; ships pickled data |
+
+### A.6 Async generators — `async def` + `yield`
+
+A function that is `async def` **and** contains `yield` is an **async generator**. You
+consume it with `async for`, and each `yield` produces one item, possibly after awaiting.
+This is what streams tokens to the HTTP client:
+
+```python
+async def event_generator(self, loop, prompt):
+    while True:
+        data = await queue.get()      # can pause
+        if data is None: break
+        yield f"data: {data}\n\n"     # emit one SSE chunk
+
+# consumed elsewhere with:  async for token in llm.event_generator(...): ...
+```
+
+`StreamingResponse` drives this generator and flushes each `yield`ed chunk to the client
+immediately — that's what makes the response "stream."
+
+### A.7 Futures (just enough)
+
+A **Future** is a placeholder for "a result that will exist later." You rarely create one
+by hand here, but `run_coroutine_threadsafe` returns one, and it's worth knowing the shape:
+
+```python
+fut = asyncio.run_coroutine_threadsafe(coro, loop)
+# fut.result(timeout=...)  # <- would block the CALLING (background) thread until done
+```
+
+In this project the returned Future is intentionally **ignored** — the background thread
+fires the `queue.put(...)` and moves on ("fire and forget"), rather than waiting for
+confirmation. That keeps the model loop churning at full speed.
+
+### A.8 `run_coroutine_threadsafe` — the thread → loop bridge
+
+The one function that ties the whole design together:
+
+```python
+asyncio.run_coroutine_threadsafe(coro, loop)
+```
+
+- **Who calls it:** code running on a *different* thread than the loop (Context B).
+- **What it does:** thread-safely schedules `coro` to run *on `loop`'s own thread*, and
+  returns a `concurrent.futures.Future` for the result.
+- **Why it's needed:** it's the only sanctioned way to poke an event loop from outside its
+  thread. It lets the background thread perform the loop-owned `queue.put(...)` without ever
+  touching the (non-thread-safe) queue directly.
+
+Contrast the three "run a coroutine" tools so you don't mix them up:
+
+| Call | Call it from | Purpose |
+|---|---|---|
+| `await coro` | inside a coroutine (on the loop) | run and wait, cooperatively |
+| `asyncio.create_task(coro)` | inside a coroutine (on the loop) | schedule concurrently on the same loop |
+| `asyncio.run_coroutine_threadsafe(coro, loop)` | **another thread** | schedule onto the loop safely from outside |
+
+### A.9 `time.sleep` vs. `asyncio.sleep`
+
+- `await asyncio.sleep(0.1)` — pauses **one coroutine**, loop keeps serving others. Use on
+  the event loop.
+- `time.sleep(0.1)` — blocks the **entire thread**. Fine in the background worker thread
+  (it's a plain thread with nothing else to do), but it would be a serious bug on the event
+  loop, because it would freeze every request. Notice `requests_processing_loop` correctly
+  uses `time.sleep`.
+
+### A.10 Putting the vocabulary back together
+
+The tutorial's flow in one sentence of jargon: an **async generator** running on the
+**event loop** `await`s an **asyncio.Queue** (parking cooperatively), while a separate
+**thread** uses **`run_coroutine_threadsafe`** to schedule `queue.put(...)` back **onto the
+loop**, delivering tokens without violating the queue's single-thread ownership.
