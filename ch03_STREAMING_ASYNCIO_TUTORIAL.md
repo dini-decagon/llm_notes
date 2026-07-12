@@ -233,30 +233,39 @@ owning loop. Thread-safety preserved. ✅
 
 Here's the round trip, drawn out in time:
 
-```
-CONTEXT A (event loop thread)              CONTEXT B (background worker thread)
-────────────────────────────────          ──────────────────────────────────────
-event_generator():
-  queue = asyncio.Queue()
-  add_streaming_request(prompt, queue, loop)  ──(shared via WorkloadManager)──►
-  await queue.get()   ← parked, idle
-        .                                     get_next_batch()  → finds our sequence
-        .                                     execute_forward_batch(...)  → token "cat"
-        .                                     run_coroutine_threadsafe(
-        .                                         queue.put("cat"), loop )
-        .                                          │
-   ◄────────────────────────────────────────────┘  (loop schedules the put on A)
-  queue.get() returns "cat"
-  yield 'data: {"token":"cat",...}'  → flushed to HTTP client
-  await queue.get()   ← parked again
-        .                                     ...next forward pass → token "sat"...
-        .                                     run_coroutine_threadsafe(queue.put("sat"), loop)
-   ◄────────────────────────────────────────────
-  yield 'data: {"token":"sat",...}'
-        .                                     ...model signals is_finished...
-        .                                     run_coroutine_threadsafe(queue.put(None), loop)
-   ◄────────────────────────────────────────────
-  queue.get() returns None → break → response ends, connection closes
+```mermaid
+sequenceDiagram
+    participant Client as HTTP Client
+    participant A as Context A<br/>event_generator (event loop)
+    participant Q as asyncio.Queue<br/>(owned by A)
+    participant B as Context B<br/>requests_processing_loop (thread)
+    participant C as Context C<br/>model worker (process)
+
+    Note over A: queue = asyncio.Queue()
+    A->>B: add_streaming_request(prompt, queue, loop)<br/>(shared via WorkloadManager)
+    A->>Q: await queue.get()
+    Note over A,Q: parked, idle — loop free for others
+
+    B->>B: get_next_batch() → finds our sequence
+    B->>C: execute_forward_batch(...)
+    C-->>B: token "cat"
+    B->>Q: run_coroutine_threadsafe(queue.put("cat"), loop)
+    Note right of B: put is scheduled ON A's thread
+    Q-->>A: queue.get() returns "cat"
+    A->>Client: yield data: {"token":"cat", ...}
+    A->>Q: await queue.get() (parked again)
+
+    B->>C: execute_forward_batch(...)
+    C-->>B: token "sat"
+    B->>Q: run_coroutine_threadsafe(queue.put("sat"), loop)
+    Q-->>A: queue.get() returns "sat"
+    A->>Client: yield data: {"token":"sat", ...}
+
+    B->>C: execute_forward_batch(...)
+    C-->>B: is_finished
+    B->>Q: run_coroutine_threadsafe(queue.put(None), loop)
+    Q-->>A: queue.get() returns None
+    Note over A,Client: break → response ends, connection closes
 ```
 
 So the two threads never touch each other's data directly. They communicate through
